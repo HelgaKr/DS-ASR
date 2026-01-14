@@ -82,6 +82,16 @@ initial_count = len(dataset)
 dataset = dataset.filter(filter_by_ratio)
 filtered_ratio = initial_count - len(dataset)
 
+
+# NOTE: I am using the full dataset for training. To use 10% for validation, replace
+# the line below with:
+#
+#   split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
+#   train_dataset = split_dataset["train"]
+#   eval_dataset = split_dataset["test"]
+#
+# Then add 'eval_dataset=eval_dataset' to the Trainer initialization.
+
 train_dataset = dataset
 
 print(f"Loaded {len(train_dataset)} training samples")
