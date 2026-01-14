@@ -1,3 +1,5 @@
+#!/bin/bash
+
 #NOTE: If you want to reuse this Slurm script, adjust the settings below for your infrastructure.
 #Usually, each university has a guide to its computing infrastructure.
 #For the U of Saskatchewan guide, see https://wiki.usask.ca/display/ARC/Plato+HPC+Cluster
