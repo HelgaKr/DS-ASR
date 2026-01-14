@@ -83,6 +83,16 @@ dataset = dataset.filter(filter_by_ratio)
 filtered_ratio = initial_count - len(dataset)
 print(f"Removed {filtered_ratio} files with audio too short for text length")
 
+
+# NOTE: I am using the full dataset for training. To use 10% for validation, replace
+# the line below with:
+#
+#   split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
+#   train_dataset = split_dataset["train"]
+#   eval_dataset = split_dataset["test"]
+#
+# Then add 'eval_dataset=eval_dataset' to the Trainer initialization.
+
 train_dataset = dataset
 
 print(f"Loaded {len(train_dataset)} training samples")
@@ -166,6 +176,7 @@ def prepare_dataset(batch):
     batch["input_length"] = len(batch["input_features"])
     batch["labels"] = processor(text=batch["sentence"]).input_ids
     return batch
+
 
 train_dataset = train_dataset.map(
     prepare_dataset,
