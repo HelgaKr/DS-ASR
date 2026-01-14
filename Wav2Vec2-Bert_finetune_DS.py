@@ -24,7 +24,7 @@ from transformers import (
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
+# If you wish to reuse this script for your training, adjust these variables.
 AUDIO_FOLDER = "./dataset/"                # Folder containing audio files
 CSV_PATH = "./metadata.csv"                # CSV with columns: 'filename', 'transcription'
 REPO_NAME = "/wav2vec2-bert"               # Name for saving model
