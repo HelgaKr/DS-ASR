@@ -1,0 +1,261 @@
+import torch
+import numpy as np
+import librosa
+import os
+import time
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
+import tempfile
+
+# Configuration
+MODEL_DIR = "/whisper-DS"
+
+# Load model at startup
+print("Loading model...")
+processor = WhisperProcessor.from_pretrained(MODEL_DIR)
+model = WhisperForConditionalGeneration.from_pretrained(MODEL_DIR)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+model.to(device)
+model.eval()
+
+if torch.cuda.is_available():
+    model = model.half()
+
+print("Model loaded and ready.")
+
+# FastAPI app
+app = FastAPI(title="DS ASR tool")
+
+
+def detect_silence_segments(audio, sample_rate, min_silence_duration=0.5, silence_threshold=0.01, frame_duration=0.025):
+    frame_length = int(frame_duration * sample_rate)
+    hop_length = frame_length // 2
+
+    rms_frames = []
+    timestamps = []
+
+    for i in range(0, len(audio) - frame_length, hop_length):
+        frame = audio[i:i + frame_length]
+        rms = np.sqrt(np.mean(frame ** 2))
+        rms_frames.append(rms)
+        timestamps.append(i / sample_rate)
+
+    rms_frames = np.array(rms_frames)
+    timestamps = np.array(timestamps)
+
+    window_size = 5
+    if len(rms_frames) >= window_size:
+        rms_smoothed = np.convolve(rms_frames, np.ones(window_size) / window_size, mode='same')
+    else:
+        rms_smoothed = rms_frames
+
+    is_speech = rms_smoothed > silence_threshold
+
+    speech_segments = []
+    in_speech = False
+    speech_start = None
+
+    for i, speech in enumerate(is_speech):
+        current_time = timestamps[i]
+
+        if speech and not in_speech:
+            speech_start = current_time
+            in_speech = True
+        elif not speech and in_speech:
+            speech_end = current_time
+            if speech_end - speech_start > 0.3:
+                speech_segments.append((speech_start, speech_end))
+            in_speech = False
+
+    if in_speech and speech_start is not None:
+        speech_segments.append((speech_start, len(audio) / sample_rate))
+
+    return speech_segments
+
+
+def merge_short_segments(segments, min_segment_duration=1.0, max_segment_duration=15.0, max_gap_to_merge=1.5):
+    if not segments:
+        return []
+
+    merged = []
+    current_start, current_end = segments[0]
+
+    for i in range(1, len(segments)):
+        next_start, next_end = segments[i]
+
+        gap = next_start - current_end
+        current_duration = current_end - current_start
+        combined_duration = next_end - current_start
+
+        should_merge = (
+            gap <= max_gap_to_merge and
+            current_duration < min_segment_duration or
+            combined_duration <= max_segment_duration
+        )
+
+        if should_merge:
+            current_end = next_end
+        else:
+            merged.append((current_start, current_end))
+            current_start, current_end = next_start, next_end
+
+    merged.append((current_start, current_end))
+
+    final_segments = []
+    for start, end in merged:
+        duration = end - start
+        if duration > max_segment_duration:
+            num_parts = int(np.ceil(duration / max_segment_duration))
+            part_duration = duration / num_parts
+            for i in range(num_parts):
+                part_start = start + i * part_duration
+                part_end = start + (i + 1) * part_duration
+                final_segments.append((part_start, min(part_end, end)))
+        else:
+            final_segments.append((start, end))
+
+    return final_segments
+
+
+def transcribe_segment(audio_segment, start_time, end_time):
+    try:
+        if len(audio_segment) == 0:
+            return ""
+
+        max_val = np.max(np.abs(audio_segment))
+        if max_val > 0:
+            audio_segment = audio_segment / max_val
+        else:
+            return ""
+
+        padding = int(0.1 * 16000)
+        audio_segment = np.pad(audio_segment, (padding, padding), mode='constant', constant_values=0)
+
+        inputs = processor(audio_segment, sampling_rate=16000, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        if torch.cuda.is_available():
+            inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            predicted_ids = model.generate(
+                **inputs,
+                max_length=448,
+                num_beams=5,
+                length_penalty=1.0,
+                no_repeat_ngram_size=3,
+                early_stopping=True,
+                pad_token_id=processor.tokenizer.eos_token_id
+            )
+
+        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        return transcription
+
+    except Exception as e:
+        print(f"Error transcribing segment {start_time:.1f}-{end_time:.1f}s: {e}")
+        return ""
+
+
+def run_transcription(audio_path: str):
+    """
+    Expects a 16kHz mono WAV file.
+    Preprocessing (resampling, format conversion) is handled by the web VM before sending.
+    """
+    # Silence detection settings
+    SILENCE_THRESHOLD = 0.01       # RMS threshold below which audio is considered silent
+    MIN_SILENCE_DURATION = 0.4     # Minimum pause duration to split segments (seconds)
+    MIN_SEGMENT_DURATION = 1.0     # Merge segments shorter than this (seconds)
+
+    start = time.time()
+
+    # Load audio — already 16kHz mono WAV
+    audio_input, _ = librosa.load(audio_path, sr=16000)
+    total_duration = len(audio_input) / 16000
+    print(f"Processing audio: {total_duration:.1f} seconds")
+
+    # Short audio: single-pass inference
+    if total_duration <= 8:
+        max_val = np.max(np.abs(audio_input))
+        if max_val > 0:
+            audio_input = audio_input / max_val
+
+        inputs = processor(audio_input, sampling_rate=16000, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        if torch.cuda.is_available():
+            inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            predicted_ids = model.generate(
+                **inputs,
+                max_length=448,
+                num_beams=5,
+                length_penalty=1.0
+            )
+
+        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        return {"transcription": transcription, "processing_time": round(time.time() - start, 2)}
+
+    # Longer audio: silence-based segmentation
+    speech_segments = detect_silence_segments(
+        audio_input,
+        16000,
+        min_silence_duration=MIN_SILENCE_DURATION,
+        silence_threshold=SILENCE_THRESHOLD
+    )
+
+    optimized_segments = merge_short_segments(
+        speech_segments,
+        min_segment_duration=MIN_SEGMENT_DURATION,
+        max_segment_duration=15.0,
+        max_gap_to_merge=1.5
+    )
+
+    transcriptions = []
+    for i, (seg_start, seg_end) in enumerate(optimized_segments):
+        start_sample = int(seg_start * 16000)
+        end_sample = int(seg_end * 16000)
+        segment_audio = audio_input[start_sample:end_sample]
+
+        transcription = transcribe_segment(segment_audio, seg_start, seg_end)
+        if transcription.strip():
+            transcriptions.append(transcription)
+
+    final_transcription = " ".join(transcriptions)
+    return {"transcription": final_transcription, "processing_time": round(time.time() - start, 2)}
+
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    """
+    Accepts a 16kHz mono WAV file from the web VM and returns the transcription.
+    """
+    if not file.filename.endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Expected a .wav file")
+
+    # Save uploaded file to a temp location
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        result = run_transcription(tmp_path)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        os.remove(tmp_path)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "device": str(device)}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
